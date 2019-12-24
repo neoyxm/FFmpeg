@@ -22,10 +22,16 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/audio_fifo.h"
+#include "libavutil/avstring.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
 #include "audio.h"
 #include "formats.h"
+
+#include "af_anlmdndsp.h"
+
+#define WEIGHT_LUT_NBITS 20
+#define WEIGHT_LUT_SIZE  (1<<WEIGHT_LUT_NBITS)
 
 #define SQR(x) ((x) * (x))
 
@@ -35,6 +41,11 @@ typedef struct AudioNLMeansContext {
     float a;
     int64_t pd;
     int64_t rd;
+    float m;
+    int om;
+
+    float pdiff_lut_scale;
+    float weight_lut[WEIGHT_LUT_SIZE];
 
     int K;
     int S;
@@ -48,17 +59,31 @@ typedef struct AudioNLMeansContext {
     int64_t pts;
 
     AVAudioFifo *fifo;
+    int eof_left;
 
-    float (*compute_distance)(const float *f1, const float *f2, int K);
+    AudioNLMDNDSPContext dsp;
 } AudioNLMeansContext;
+
+enum OutModes {
+    IN_MODE,
+    OUT_MODE,
+    NOISE_MODE,
+    NB_MODES
+};
 
 #define OFFSET(x) offsetof(AudioNLMeansContext, x)
 #define AF AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
+#define AFT AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
 static const AVOption anlmdn_options[] = {
-    { "s", "set denoising strength", OFFSET(a),  AV_OPT_TYPE_FLOAT,    {.dbl=1},       1,   9999, AF },
+    { "s", "set denoising strength", OFFSET(a),  AV_OPT_TYPE_FLOAT,    {.dbl=0.00001},0.00001, 10, AFT },
     { "p", "set patch duration",     OFFSET(pd), AV_OPT_TYPE_DURATION, {.i64=2000}, 1000, 100000, AF },
     { "r", "set research duration",  OFFSET(rd), AV_OPT_TYPE_DURATION, {.i64=6000}, 2000, 300000, AF },
+    { "o", "set output mode",        OFFSET(om), AV_OPT_TYPE_INT,      {.i64=OUT_MODE},  0, NB_MODES-1, AFT, "mode" },
+    {  "i", "input",                 0,          AV_OPT_TYPE_CONST,    {.i64=IN_MODE},   0,  0, AFT, "mode" },
+    {  "o", "output",                0,          AV_OPT_TYPE_CONST,    {.i64=OUT_MODE},  0,  0, AFT, "mode" },
+    {  "n", "noise",                 0,          AV_OPT_TYPE_CONST,    {.i64=NOISE_MODE},0,  0, AFT, "mode" },
+    { "m", "set smooth factor",      OFFSET(m),  AV_OPT_TYPE_FLOAT,    {.dbl=11.},       1, 15, AF },
     { NULL }
 };
 
@@ -93,7 +118,7 @@ static int query_formats(AVFilterContext *ctx)
     return ff_set_common_samplerates(ctx, formats);
 }
 
-static float compute_distance_ssd(const float *f1, const float *f2, int K)
+static float compute_distance_ssd_c(const float *f1, const float *f2, ptrdiff_t K)
 {
     float distance = 0.;
 
@@ -103,17 +128,40 @@ static float compute_distance_ssd(const float *f1, const float *f2, int K)
     return distance;
 }
 
+static void compute_cache_c(float *cache, const float *f,
+                            ptrdiff_t S, ptrdiff_t K,
+                            ptrdiff_t i, ptrdiff_t jj)
+{
+    int v = 0;
+
+    for (int j = jj; j < jj + S; j++, v++)
+        cache[v] += -SQR(f[i - K - 1] - f[j - K - 1]) + SQR(f[i + K] - f[j + K]);
+}
+
+void ff_anlmdn_init(AudioNLMDNDSPContext *dsp)
+{
+    dsp->compute_distance_ssd = compute_distance_ssd_c;
+    dsp->compute_cache        = compute_cache_c;
+
+    if (ARCH_X86)
+        ff_anlmdn_init_x86(dsp);
+}
+
 static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     AudioNLMeansContext *s = ctx->priv;
+    int ret;
 
     s->K = av_rescale(s->pd, outlink->sample_rate, AV_TIME_BASE);
     s->S = av_rescale(s->rd, outlink->sample_rate, AV_TIME_BASE);
 
+    s->eof_left = -1;
     s->pts = AV_NOPTS_VALUE;
     s->H = s->K * 2 + 1;
     s->N = s->H + (s->K + s->S) * 2;
+
+    av_log(ctx, AV_LOG_DEBUG, "K:%d S:%d H:%d N:%d\n", s->K, s->S, s->H, s->N);
 
     av_frame_free(&s->in);
     av_frame_free(&s->cache);
@@ -129,7 +177,18 @@ static int config_output(AVFilterLink *outlink)
     if (!s->fifo)
         return AVERROR(ENOMEM);
 
-    s->compute_distance = compute_distance_ssd;
+    ret = av_audio_fifo_write(s->fifo, (void **)s->in->extended_data, s->K + s->S);
+    if (ret < 0)
+        return ret;
+
+    s->pdiff_lut_scale = 1.f / s->m * WEIGHT_LUT_SIZE;
+    for (int i = 0; i < WEIGHT_LUT_SIZE; i++) {
+        float w = -i / s->pdiff_lut_scale;
+
+        s->weight_lut[i] = expf(w);
+    }
+
+    ff_anlmdn_init(&s->dsp);
 
     return 0;
 }
@@ -140,10 +199,12 @@ static int filter_channel(AVFilterContext *ctx, void *arg, int ch, int nb_jobs)
     AVFrame *out = arg;
     const int S = s->S;
     const int K = s->K;
+    const int om = s->om;
     const float *f = (const float *)(s->in->extended_data[ch]) + K;
     float *cache = (float *)s->cache->extended_data[ch];
-    const float sw = 32768.f / s->a;
+    const float sw = (65536.f / (4 * K + 2)) / sqrtf(s->a);
     float *dst = (float *)out->extended_data[ch] + s->offset;
+    const float smooth = s->m;
 
     for (int i = S; i < s->H + S; i++) {
         float P = 0.f, Q = 0.f;
@@ -153,25 +214,28 @@ static int filter_channel(AVFilterContext *ctx, void *arg, int ch, int nb_jobs)
             for (int j = i - S; j <= i + S; j++) {
                 if (i == j)
                     continue;
-                cache[v++] = s->compute_distance(f + i, f + j, K);
+                cache[v++] = s->dsp.compute_distance_ssd(f + i, f + j, K);
             }
         } else {
-            for (int j = i - S; j < i; j++, v++)
-                cache[v] = cache[v] - SQR(f[i - K - 1] - f[j - K - 1]) + SQR(f[i + K] - f[j + K]);
-
-            for (int j = i + 1; j <= i + S; j++, v++)
-                cache[v] = cache[v] - SQR(f[i - K - 1] - f[j - K - 1]) + SQR(f[i + K] - f[j + K]);
+            s->dsp.compute_cache(cache, f, S, K, i, i - S);
+            s->dsp.compute_cache(cache + S, f, S, K, i, i + 1);
         }
 
-        for (int j = 0; j < v; j++) {
+        for (int j = 0; j < 2 * S && !ctx->is_disabled; j++) {
             const float distance = cache[j];
+            unsigned weight_lut_idx;
             float w;
 
-            av_assert0(distance >= 0.f);
-            w = -distance * sw;
-            if (w < -11.f)
+            if (distance < 0.f) {
+                cache[j] = 0.f;
                 continue;
-            w = expf(w);
+            }
+            w = distance * sw;
+            if (w >= smooth)
+                continue;
+            weight_lut_idx = w * s->pdiff_lut_scale;
+            av_assert2(weight_lut_idx < WEIGHT_LUT_SIZE);
+            w = s->weight_lut[weight_lut_idx];
             P += w * f[i - S + j + (j >= S)];
             Q += w;
         }
@@ -179,7 +243,11 @@ static int filter_channel(AVFilterContext *ctx, void *arg, int ch, int nb_jobs)
         P += f[i];
         Q += 1;
 
-        dst[i - S] = P / Q;
+        switch (om) {
+        case IN_MODE:    dst[i - S] = f[i];           break;
+        case OUT_MODE:   dst[i - S] = P / Q;          break;
+        case NOISE_MODE: dst[i - S] = f[i] - (P / Q); break;
+        }
     }
 
     return 0;
@@ -226,9 +294,38 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     if (out) {
         out->pts = s->pts;
         out->nb_samples = s->offset;
-        s->pts += s->offset;
+        if (s->eof_left >= 0) {
+            out->nb_samples = FFMIN(s->eof_left, s->offset);
+            s->eof_left -= out->nb_samples;
+        }
+        s->pts += av_rescale_q(s->offset, (AVRational){1, outlink->sample_rate}, outlink->time_base);
 
         return ff_filter_frame(outlink, out);
+    }
+
+    return ret;
+}
+
+static int request_frame(AVFilterLink *outlink)
+{
+    AVFilterContext *ctx = outlink->src;
+    AudioNLMeansContext *s = ctx->priv;
+    int ret;
+
+    ret = ff_request_frame(ctx->inputs[0]);
+
+    if (ret == AVERROR_EOF && s->eof_left != 0) {
+        AVFrame *in;
+
+        if (s->eof_left < 0)
+            s->eof_left = av_audio_fifo_size(s->fifo) - (s->S + s->K);
+        if (s->eof_left <= 0)
+            return AVERROR_EOF;
+        in = ff_get_audio_buffer(outlink, s->H);
+        if (!in)
+            return AVERROR(ENOMEM);
+
+        return filter_frame(ctx->inputs[0], in);
     }
 
     return ret;
@@ -257,6 +354,7 @@ static const AVFilterPad outputs[] = {
         .name          = "default",
         .type          = AVMEDIA_TYPE_AUDIO,
         .config_props  = config_output,
+        .request_frame = request_frame,
     },
     { NULL }
 };
@@ -270,5 +368,7 @@ AVFilter ff_af_anlmdn = {
     .uninit        = uninit,
     .inputs        = inputs,
     .outputs       = outputs,
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
+    .process_command = ff_filter_process_command,
+    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS,
 };

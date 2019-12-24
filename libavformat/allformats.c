@@ -70,6 +70,7 @@ extern AVOutputFormat ff_ast_muxer;
 extern AVOutputFormat ff_asf_stream_muxer;
 extern AVInputFormat  ff_au_demuxer;
 extern AVOutputFormat ff_au_muxer;
+extern AVInputFormat  ff_av1_demuxer;
 extern AVInputFormat  ff_avi_demuxer;
 extern AVOutputFormat ff_avi_muxer;
 extern AVInputFormat  ff_avisynth_demuxer;
@@ -176,6 +177,7 @@ extern AVOutputFormat ff_h263_muxer;
 extern AVInputFormat  ff_h264_demuxer;
 extern AVOutputFormat ff_h264_muxer;
 extern AVOutputFormat ff_hash_muxer;
+extern AVInputFormat  ff_hcom_demuxer;
 extern AVOutputFormat ff_hds_muxer;
 extern AVInputFormat  ff_hevc_demuxer;
 extern AVOutputFormat ff_hevc_muxer;
@@ -187,6 +189,7 @@ extern AVOutputFormat ff_ico_muxer;
 extern AVInputFormat  ff_idcin_demuxer;
 extern AVInputFormat  ff_idf_demuxer;
 extern AVInputFormat  ff_iff_demuxer;
+extern AVInputFormat  ff_ifv_demuxer;
 extern AVInputFormat  ff_ilbc_demuxer;
 extern AVOutputFormat ff_ilbc_muxer;
 extern AVInputFormat  ff_image2_demuxer;
@@ -209,6 +212,7 @@ extern AVInputFormat  ff_ivr_demuxer;
 extern AVInputFormat  ff_jacosub_demuxer;
 extern AVOutputFormat ff_jacosub_muxer;
 extern AVInputFormat  ff_jv_demuxer;
+extern AVInputFormat  ff_kux_demuxer;
 extern AVOutputFormat ff_latm_muxer;
 extern AVInputFormat  ff_lmlm4_demuxer;
 extern AVInputFormat  ff_loas_demuxer;
@@ -390,6 +394,7 @@ extern AVInputFormat  ff_srt_demuxer;
 extern AVOutputFormat ff_srt_muxer;
 extern AVInputFormat  ff_str_demuxer;
 extern AVInputFormat  ff_stl_demuxer;
+extern AVOutputFormat ff_streamhash_muxer;
 extern AVInputFormat  ff_subviewer1_demuxer;
 extern AVInputFormat  ff_subviewer_demuxer;
 extern AVInputFormat  ff_sup_demuxer;
@@ -582,7 +587,11 @@ AVInputFormat *av_iformat_next(const AVInputFormat *f)
     ff_thread_once(&av_format_next_init, av_format_init_next);
 
     if (f)
+#if FF_API_AVIOFORMAT
         return f->next;
+#else
+        return (AVInputFormat *) f->next;
+#endif
     else {
         void *opaque = NULL;
         return (AVInputFormat *)av_demuxer_iterate(&opaque);
@@ -594,7 +603,11 @@ AVOutputFormat *av_oformat_next(const AVOutputFormat *f)
     ff_thread_once(&av_format_next_init, av_format_init_next);
 
     if (f)
+#if FF_API_AVIOFORMAT
         return f->next;
+#else
+        return (AVOutputFormat *) f->next;
+#endif
     else {
         void *opaque = NULL;
         return (AVOutputFormat *)av_muxer_iterate(&opaque);

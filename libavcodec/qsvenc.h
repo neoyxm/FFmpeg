@@ -36,6 +36,10 @@
 
 #define QSV_HAVE_CO2 QSV_VERSION_ATLEAST(1, 6)
 #define QSV_HAVE_CO3 QSV_VERSION_ATLEAST(1, 11)
+#define QSV_HAVE_CO_VPS  QSV_VERSION_ATLEAST(1, 17)
+
+#define QSV_HAVE_EXT_HEVC_TILES QSV_VERSION_ATLEAST(1, 13)
+#define QSV_HAVE_EXT_VP9_PARAM QSV_VERSION_ATLEAST(1, 26)
 
 #define QSV_HAVE_TRELLIS QSV_VERSION_ATLEAST(1, 8)
 #define QSV_HAVE_MAX_SLICE_SIZE QSV_VERSION_ATLEAST(1, 9)
@@ -45,6 +49,8 @@
 #define QSV_HAVE_LA_DS  QSV_VERSION_ATLEAST(1, 8)
 #define QSV_HAVE_LA_HRD QSV_VERSION_ATLEAST(1, 11)
 #define QSV_HAVE_VDENC  QSV_VERSION_ATLEAST(1, 15)
+
+#define QSV_HAVE_GPB    QSV_VERSION_ATLEAST(1, 18)
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #define QSV_HAVE_AVBR   QSV_VERSION_ATLEAST(1, 3)
@@ -56,7 +62,7 @@
 #define QSV_HAVE_AVBR   0
 #define QSV_HAVE_ICQ    QSV_VERSION_ATLEAST(1, 28)
 #define QSV_HAVE_VCM    0
-#define QSV_HAVE_QVBR   0
+#define QSV_HAVE_QVBR   QSV_VERSION_ATLEAST(1, 28)
 #define QSV_HAVE_MF     QSV_VERSION_ATLEAST(1, 25)
 #endif
 
@@ -89,6 +95,7 @@
 { "adaptive_b",     "Adaptive B-frame placement",             OFFSET(qsv.adaptive_b),     AV_OPT_TYPE_INT, { .i64 = -1 }, -1,          1, VE },                         \
 { "b_strategy",     "Strategy to choose between I/P/B-frames", OFFSET(qsv.b_strategy),    AV_OPT_TYPE_INT, { .i64 = -1 }, -1,          1, VE },                         \
 { "forced_idr",     "Forcing I frames as IDR frames",         OFFSET(qsv.forced_idr),     AV_OPT_TYPE_BOOL,{ .i64 = 0  },  0,          1, VE },                         \
+{ "low_power", "enable low power mode(experimental: many limitations by mfx version, BRC modes, etc.)", OFFSET(qsv.low_power), AV_OPT_TYPE_BOOL, { .i64 = 0}, 0, 1, VE},\
 
 typedef int SetEncodeCtrlCB (AVCodecContext *avctx,
                              const AVFrame *frame, mfxEncodeCtrl* enc_ctrl);
@@ -98,7 +105,7 @@ typedef struct QSVEncContext {
     QSVFrame *work_frames;
 
     mfxSession session;
-    mfxSession internal_session;
+    QSVSession internal_qs;
 
     int packet_size;
     int width_align;
@@ -111,15 +118,25 @@ typedef struct QSVEncContext {
 #if QSV_HAVE_CO2
     mfxExtCodingOption2 extco2;
 #endif
+#if QSV_HAVE_CO3
+    mfxExtCodingOption3 extco3;
+#endif
 #if QSV_HAVE_MF
     mfxExtMultiFrameParam   extmfp;
     mfxExtMultiFrameControl extmfc;
 #endif
+#if QSV_HAVE_EXT_HEVC_TILES
+    mfxExtHEVCTiles exthevctiles;
+#endif
+#if QSV_HAVE_EXT_VP9_PARAM
+    mfxExtVP9Param  extvp9param;
+#endif
+
     mfxExtOpaqueSurfaceAlloc opaque_alloc;
     mfxFrameSurface1       **opaque_surfaces;
     AVBufferRef             *opaque_alloc_buf;
 
-    mfxExtBuffer  *extparam_internal[2 + QSV_HAVE_CO2 + (QSV_HAVE_MF * 2)];
+    mfxExtBuffer  *extparam_internal[2 + QSV_HAVE_CO2 + QSV_HAVE_CO3 + (QSV_HAVE_MF * 2)];
     int         nb_extparam_internal;
 
     mfxExtBuffer **extparam;
@@ -127,6 +144,10 @@ typedef struct QSVEncContext {
     AVFifoBuffer *async_fifo;
 
     QSVFramesContext frames_ctx;
+
+    mfxVersion          ver;
+
+    int hevc_vps;
 
     // options set by the caller
     int async_depth;
@@ -144,11 +165,13 @@ typedef struct QSVEncContext {
     int max_frame_size;
     int max_slice_size;
 
+    int tile_cols;
+    int tile_rows;
+
     int aud;
 
     int single_sei_nal_unit;
     int max_dec_frame_buffering;
-    int trellis;
 
     int bitrate_limit;
     int mbbrc;
@@ -165,6 +188,7 @@ typedef struct QSVEncContext {
 
     int repeat_pps;
     int low_power;
+    int gpb;
 
     int a53_cc;
 
